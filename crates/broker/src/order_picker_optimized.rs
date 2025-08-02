@@ -136,7 +136,6 @@ where
         new_order_rx: mpsc::Receiver<Box<OrderRequest>>,
         order_result_tx: mpsc::Sender<Box<OrderRequest>>,
         stake_token_decimals: u8,
-        _order_state_tx: tokio::sync::broadcast::Sender<crate::OrderStateChange>,
     ) -> Self {
         let market = BoundlessMarketService::new(
             market_addr,
@@ -551,17 +550,6 @@ where
     async fn available_stake_balance(&self) -> Result<U256> {
         let balance = self.market.balance_of_stake(self.provider.default_signer_address()).await?;
         Ok(balance)
-    }
-    
-    /// Select the next order for pricing - simplified for maximum speed (0.12.0 style)
-    fn select_next_pricing_order(
-        &self,
-        pending_orders: &mut VecDeque<Box<OrderRequest>>,
-        _priority_mode: OrderPricingPriority,
-    ) -> Option<Box<OrderRequest>> {
-        // 简化版本：直接取第一个订单，最大化速度
-        // 0.12.0风格：不浪费时间在排序上，立即处理
-        pending_orders.pop_front()
     }
 }
 

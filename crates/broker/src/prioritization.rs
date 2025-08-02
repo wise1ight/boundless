@@ -16,7 +16,7 @@ use crate::{
     config::{OrderCommitmentPriority, OrderPricingPriority},
     order_monitor::OrderMonitor,
     order_picker::OrderPicker,
-    OrderRequest,
+    FulfillmentType, OrderRequest,
 };
 
 use rand::seq::SliceRandom;
@@ -82,7 +82,13 @@ where
             // Already in observation time order, no sorting needed
         }
         UnifiedPriorityMode::ShortestExpiry => {
-            orders.sort_by_key(|order| order.as_ref().expiry());
+            orders.sort_by_key(|order| {
+                let order_ref = order.as_ref();
+                match order_ref.fulfillment_type {
+                    FulfillmentType::LockAndFulfill => order_ref.request.lock_expires_at(),
+                    _ => order_ref.request.expires_at(),
+                }
+            });
         }
     }
 }
@@ -136,7 +142,6 @@ mod tests {
     use crate::now_timestamp;
     use crate::order_monitor::tests::setup_om_test_context;
     use crate::order_picker::tests::{OrderParams, PickerTestCtxBuilder};
-    use crate::FulfillmentType;
     use tracing_test::traced_test;
 
     #[tokio::test]

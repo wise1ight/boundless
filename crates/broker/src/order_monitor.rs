@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::chain_monitor::ChainHead;
+use crate::flashblocks_utils::FlashblocksProviderExt;
 use crate::OrderRequest;
 use crate::{
     chain_monitor::ChainMonitorService,
@@ -228,8 +229,7 @@ where
             .market
             .get_status(request_id, Some(order.request.expires_at()))
             .await
-            .context("Failed to get request status")
-            .map_err(OrderMonitorErr::RpcErr)?;
+            .context("Failed to get request status")?;
         if order_status != RequestStatus::Unknown {
             tracing::info!("Request {:x} not open: {order_status:?}, skipping", request_id);
             // TODO: fetch some chain data to find out who / and for how much the order
@@ -283,21 +283,30 @@ where
                         OrderMonitorErr::LockTxFailed(format!("Tx hash 0x{e:x}"))
                     }
                     MarketError::Error(e) => {
+                        let error_msg = e.to_string().to_lowercase();
+                        
+                        // Check for nonce-related errors first
+                        if error_msg.contains("nonce too low") || 
+                           error_msg.contains("nonce already used") || 
+                           error_msg.contains("nonce gap") {
+                            tracing::warn!("Lock transaction failed due to nonce error: {e}. This will be retried with fresh nonce.");
+                            OrderMonitorErr::LockTxFailed(format!("Nonce error (will retry): {e}"))
+                        }
                         // Insufficient balance error is thrown both when the requestor has insufficient balance,
                         // Requestor having insufficient balance can happen and is out of our control. The prover
                         // having insufficient balance is unexpected as we should have checked for that before
                         // committing to locking the order.
-                        let prover_addr_str =
-                            self.prover_addr.to_string().to_lowercase().replace("0x", "");
-                        if e.to_string().contains("InsufficientBalance") {
-                            if e.to_string().to_lowercase().contains(&prover_addr_str) {
+                        else if error_msg.contains("insufficientbalance") {
+                            let prover_addr_str =
+                                self.prover_addr.to_string().to_lowercase().replace("0x", "");
+                            if error_msg.contains(&prover_addr_str) {
                                 OrderMonitorErr::InsufficientBalance
                             } else {
                                 OrderMonitorErr::LockTxFailed(format!(
                                     "Requestor has insufficient balance at lock time: {e}"
                                 ))
                             }
-                        } else if e.to_string().contains("RequestIsLocked") {
+                        } else if error_msg.contains("requestislocked") {
                             OrderMonitorErr::AlreadyLocked
                         } else {
                             OrderMonitorErr::UnexpectedError(e)
@@ -419,12 +428,11 @@ where
             current_block_timestamp: u64,
             min_deadline: u64,
         ) -> bool {
-            let expiration = order.expiry();
-            if expiration < current_block_timestamp {
+            if order.request.expires_at() < current_block_timestamp {
                 tracing::debug!("Request {:x} has now expired. Skipping.", order.request.id);
                 false
-            } else if expiration.saturating_sub(now_timestamp()) < min_deadline {
-                tracing::debug!("Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.", order.request.id, expiration, min_deadline);
+            } else if order.request.expires_at().saturating_sub(crate::now_timestamp()) < min_deadline {
+                tracing::debug!("Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.", order.request.id, order.request.expires_at(), min_deadline);
                 false
             } else {
                 true
@@ -523,15 +531,27 @@ where
     }
 
     async fn lock_and_prove_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<()> {
-        let lock_jobs = orders.iter().map(|order| {
-            async move {
-                let order_id = order.id();
-                if order.fulfillment_type == FulfillmentType::LockAndFulfill {
-                    let request_id = order.request.id;
-                    match self.lock_order(order).await {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        
+        let mut lock_stream = FuturesUnordered::new();
+        
+        // Add all lock tasks to the stream
+        for order in orders {
+            let order_clone = order.clone();
+            let self_clone = self.clone();
+            
+            lock_stream.push(async move {
+                let order_id = order_clone.id();
+                let start_time = std::time::Instant::now();
+                
+                if order_clone.fulfillment_type == FulfillmentType::LockAndFulfill {
+                    let request_id = order_clone.request.id;
+                    match self_clone.lock_order(&order_clone).await {
                         Ok(lock_price) => {
-                            tracing::info!("Locked request: 0x{:x}", request_id);
-                            if let Err(err) = self.db.insert_accepted_request(order, lock_price).await {
+                            let lock_duration = start_time.elapsed();
+                            tracing::info!("Locked request: 0x{:x} in {:?}", request_id, lock_duration);
+                            
+                            if let Err(err) = self_clone.db.insert_accepted_request(&order_clone, lock_price).await {
                                 tracing::error!(
                                     "FATAL STAKE AT RISK: {} failed to move from locking -> proving status {}",
                                     order_id,
@@ -547,10 +567,6 @@ where
                                         err.code()
                                     );
                                 }
-                                OrderMonitorErr::AlreadyLocked => {
-                                    // For order already locked, we don't need to print the error backtrace.
-                                    tracing::warn!("Soft failed to lock request: {order_id} - {}", err.code());
-                                }
                                 _ => {
                                     tracing::warn!(
                                         "Soft failed to lock request: {order_id} - {} - {err:?}",
@@ -558,27 +574,46 @@ where
                                     );
                                 }
                             }
-                            if let Err(err) = self.db.insert_skipped_request(order).await {
+                            if let Err(err) = self_clone.db.insert_skipped_request(&order_clone).await {
                                 tracing::error!(
                                     "Failed to set DB failure state for order: {order_id} - {err:?}"
                                 );
                             }
                         }
                     }
-                    self.lock_and_prove_cache.invalidate(&order_id).await;
+                    self_clone.lock_and_prove_cache.invalidate(&order_id).await;
                 } else {
-                    if let Err(err) = self.db.insert_accepted_request(order, U256::ZERO).await {
+                    if let Err(err) = self_clone.db.insert_accepted_request(&order_clone, U256::ZERO).await {
                         tracing::error!(
                             "Failed to set order status to pending proving: {} - {err:?}",
                             order_id
                         );
                     }
-                    self.prove_cache.invalidate(&order_id).await;
+                    self_clone.prove_cache.invalidate(&order_id).await;
                 }
-            }
-        });
-
-        futures::future::join_all(lock_jobs).await;
+                
+                order_id
+            });
+        }
+        
+        // Process results as they complete, not waiting for all
+        let mut completed_count = 0;
+        let total_count = orders.len();
+        
+        while let Some(order_id) = lock_stream.next().await {
+            completed_count += 1;
+            tracing::debug!(
+                "Completed processing order {} ({}/{})", 
+                order_id, 
+                completed_count, 
+                total_count
+            );
+        }
+        
+        tracing::info!(
+            "Finished processing {} orders", 
+            completed_count
+        );
 
         Ok(())
     }
@@ -644,7 +679,7 @@ where
             self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
         let available_balance_wei = self
             .provider
-            .get_balance(self.provider.default_signer_address())
+            .get_balance_flashblocks(self.provider.default_signer_address(), &self.config)
             .await
             .map_err(|err| OrderMonitorErr::RpcErr(err.into()))?;
 
@@ -753,7 +788,11 @@ where
 
                 let proof_time_seconds = total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz);
                 let completion_time = prover_available_at + proof_time_seconds;
-                let expiration = order.expiry();
+                let expiration = match order.fulfillment_type {
+                    FulfillmentType::LockAndFulfill => order.request.lock_expires_at(),
+                    FulfillmentType::FulfillAfterLockExpire => order.request.expires_at(),
+                    _ => panic!("Unsupported fulfillment type: {:?}", order.fulfillment_type),
+                };
 
                 if completion_time + config.batch_buffer_time_secs > expiration {
                     // If the order cannot be completed before its expiration, skip it permanently.
@@ -835,7 +874,7 @@ where
         let mut first_block = 0;
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now(),
-            tokio::time::Duration::from_secs(self.block_time),
+            tokio::time::Duration::from_millis(50), // 50ms检查间隔，最大化锁定响应速度
         );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -848,7 +887,17 @@ where
                 biased;
 
                 Some(result) = new_orders.recv() => {
-                    self.handle_new_order_result(result).await?;
+                    // 检查是否是立即锁定的订单
+                    let is_immediate = result.target_timestamp == Some(0);
+
+                    if is_immediate {
+                        tracing::info!("Processing immediate order {} directly upon receipt", result.id());
+                        // 立即处理：先加入缓存，再立即处理
+                        self.handle_new_order_result_and_process_immediately(result).await?;
+                    } else {
+                        // 常规处理：只加入缓存，等待tick
+                        self.handle_new_order_result(result).await?;
+                    }
                 }
 
                 // On each interval, process all pending orders and do the block-based logic
@@ -887,6 +936,16 @@ where
                             );
                             continue;
                         }
+
+                        // Filter out FulfillAfterLockExpire orders
+                        valid_orders.retain(|order| {
+                            if order.fulfillment_type == FulfillmentType::FulfillAfterLockExpire {
+                                tracing::info!("Skipping FulfillAfterLockExpire order: {}", order.id());
+                                false
+                            } else {
+                                true
+                            }
+                        });
 
                         // Prioritize the orders that intend to fulfill based on configured commitment priority.
                         valid_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
@@ -940,6 +999,164 @@ where
         }
         Ok(())
     }
+
+    // Handle immediate orders: add to cache and process immediately
+    async fn handle_new_order_result_and_process_immediately(
+        &self,
+        order: Box<OrderRequest>,
+    ) -> Result<(), OrderMonitorErr> {
+        let order_id = order.id();
+        let order_arc: Arc<OrderRequest> = Arc::from(order);
+
+        // 1. 先加入缓存 (与常规流程一致)
+        match order_arc.fulfillment_type {
+            FulfillmentType::LockAndFulfill => {
+                self.lock_and_prove_cache.insert(order_id.clone(), order_arc.clone()).await;
+            }
+            FulfillmentType::FulfillAfterLockExpire | FulfillmentType::FulfillWithoutLocking => {
+                self.prove_cache.insert(order_id.clone(), order_arc.clone()).await;
+            }
+        }
+
+        // 2. 立即处理订单
+        if let Err(e) = self.process_order_immediately_from_cache(order_arc).await {
+            tracing::error!("Failed to process immediate order {}: {:?}", order_id, e);
+        }
+
+        Ok(())
+    }
+
+    // Process a single immediate order from cache directly without waiting for tick
+    async fn process_order_immediately_from_cache(
+        &self,
+        order_arc: Arc<OrderRequest>,
+    ) -> Result<(), OrderMonitorErr> {
+        let ChainHead { block_number, block_timestamp } =
+            self.chain_monitor.current_chain_head().await?;
+
+        let monitor_config = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            OrderMonitorConfig {
+                min_deadline: config.market.min_deadline,
+                peak_prove_khz: config.market.peak_prove_khz,
+                max_concurrent_proofs: config.market.max_concurrent_proofs,
+                additional_proof_cycles: config.market.additional_proof_cycles,
+                batch_buffer_time_secs: config.batcher.block_deadline_buffer_secs,
+                order_commitment_priority: config.market.order_commitment_priority,
+                priority_addresses: config.market.priority_requestor_addresses.clone(),
+            }
+        };
+        
+        // Skip FulfillAfterLockExpire orders
+        if order_arc.fulfillment_type == FulfillmentType::FulfillAfterLockExpire {
+            tracing::info!("Skipping FulfillAfterLockExpire immediate order: {}", order_arc.id());
+            return Ok(());
+        }
+
+        // Validate the immediate order
+        let is_valid = match order_arc.fulfillment_type {
+            FulfillmentType::LockAndFulfill => {
+                // Check if lock expired
+                let is_lock_expired = order_arc.request.lock_expires_at() < block_timestamp;
+                if is_lock_expired {
+                    tracing::debug!("Immediate order {} lock expired, skipping", order_arc.id());
+                    self.skip_order(&order_arc, "lock expired before we locked").await;
+                    return Ok(());
+                }
+
+                // Check if already locked by someone else
+                if let Some((locker, _)) = self.db.get_request_locked(U256::from(order_arc.request.id)).await.context("Failed to check if request is locked")? {
+                    let our_address = self.provider.default_signer_address().to_string().to_lowercase();
+                    let locker_address = locker.to_lowercase();
+                    let our_address_normalized = our_address.trim_start_matches("0x");
+                    let locker_address_normalized = locker_address.trim_start_matches("0x");
+
+                    if locker_address_normalized != our_address_normalized {
+                        tracing::debug!("Immediate order {} already locked by another prover, skipping", order_arc.id());
+                        self.skip_order(&order_arc, "locked by another prover").await;
+                        return Ok(());
+                    } else {
+                        tracing::debug!("Immediate order {} already locked by us, proceeding to prove", order_arc.id());
+                    }
+                }
+
+                {
+                    // Inline deadline check (same logic as is_within_deadline)
+                    if order_arc.request.expires_at() < block_timestamp {
+                        tracing::debug!("Request {:x} has now expired. Skipping.", order_arc.request.id);
+                        false
+                    } else if order_arc.request.expires_at().saturating_sub(crate::now_timestamp()) < monitor_config.min_deadline {
+                        tracing::debug!("Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.", order_arc.request.id, order_arc.request.expires_at(), monitor_config.min_deadline);
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+            _ => {
+                // For prove-only orders, check if already fulfilled
+                let is_fulfilled = self
+                    .db
+                    .is_request_fulfilled(U256::from(order_arc.request.id))
+                    .await
+                    .context("Failed to check if request is fulfilled")?;
+                
+                if is_fulfilled {
+                    tracing::debug!("Immediate order {} was fulfilled by other, skipping", order_arc.id());
+                    self.skip_order(&order_arc, "was fulfilled by other").await;
+                    return Ok(());
+                }
+
+                {
+                    // Inline deadline check (same logic as is_within_deadline)
+                    if order_arc.request.expires_at() < block_timestamp {
+                        tracing::debug!("Request {:x} has now expired. Skipping.", order_arc.request.id);
+                        false
+                    } else if order_arc.request.expires_at().saturating_sub(crate::now_timestamp()) < monitor_config.min_deadline {
+                        tracing::debug!("Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.", order_arc.request.id, order_arc.request.expires_at(), monitor_config.min_deadline);
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+        };
+
+        if !is_valid {
+            self.skip_order(&order_arc, "insufficient deadline").await;
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Processing immediate order {} directly at block {} timestamp {}",
+            order_arc.id(),
+            block_number,
+            block_timestamp
+        );
+
+        // Apply capacity limits for immediate order (simplified check)
+        let mut prev_orders_by_status = String::new();
+        let capacity_checked_orders = self
+            .apply_capacity_limits(
+                vec![order_arc],
+                &monitor_config,
+                &mut prev_orders_by_status,
+            )
+            .await?;
+
+        if capacity_checked_orders.is_empty() {
+            tracing::warn!(
+                "Immediate order was filtered out by capacity limits, will be processed in next tick cycle"
+            );
+            return Ok(());
+        }
+
+        // Process the immediate order directly
+        self.lock_and_prove_orders(&capacity_checked_orders).await?;
+
+        Ok(())
+    }
+
 }
 
 impl<P> RetryTask for OrderMonitor<P>
@@ -1768,3 +1985,4 @@ pub(crate) mod tests {
             .any(|order| order.id() == fulfill_after_expire_order_id));
     }
 }
+

@@ -53,8 +53,10 @@ pub(crate) mod chain_monitor;
 pub mod config;
 pub(crate) mod db;
 pub(crate) mod errors;
+pub(crate) mod flashblocks_utils;
 pub mod futures_retry;
 pub(crate) mod market_monitor;
+pub(crate) mod mempool_monitor;
 pub(crate) mod offchain_market_monitor;
 pub(crate) mod order_monitor;
 pub(crate) mod order_picker;
@@ -118,7 +120,7 @@ pub struct Args {
     /// RPC HTTP retry rate limit max retry
     ///
     /// From the `RetryBackoffLayer` of Alloy
-    #[clap(long, default_value_t = 10)]
+    #[clap(long, default_value_t = 50)]
     pub rpc_retry_max: u32,
 
     /// RPC HTTP retry backoff (in ms)
@@ -268,17 +270,6 @@ impl OrderRequest {
         order.lock_price = Some(lock_price);
         order.proving_started_at = Some(Utc::now().timestamp().try_into().unwrap());
         order
-    }
-
-    /// Returns the relevant expiration timestamp for this order based on its fulfillment type.
-    /// - For LockAndFulfill orders: returns lock expiration
-    /// - For FulfillAfterLockExpire/FulfillWithoutLocking orders: returns order expiration
-    pub fn expiry(&self) -> u64 {
-        match self.fulfillment_type {
-            FulfillmentType::LockAndFulfill => self.request.lock_expires_at(),
-            FulfillmentType::FulfillAfterLockExpire => self.request.expires_at(),
-            FulfillmentType::FulfillWithoutLocking => self.request.expires_at(),
-        }
     }
 }
 
@@ -787,6 +778,7 @@ where
             Ok(())
         });
 
+
         let proving_service = Arc::new(
             proving::ProvingService::new(
                 self.db.clone(),
@@ -834,6 +826,60 @@ where
                 .context("Failed to start order monitor")?;
             Ok(())
         });
+
+        // Spin up a supervisor for the mempool monitor (if enabled)
+        {
+            let mempool_config = {
+                let cfg = config.lock_all().context("Failed to lock config")?;
+                mempool_monitor::MempoolConfig::from(&cfg.network.mempool)
+            };
+
+            if mempool_config.enabled {
+                tracing::info!("Mempool monitoring is enabled");
+                
+                // Use the same provider as onchain monitor for mempool monitoring
+                use alloy::providers::ProviderBuilder;
+
+                let rpc_url = {
+                    let cfg = config.lock_all().context("Failed to lock config")?;
+                    // Use Flashblocks RPC URL if enabled, otherwise use regular HTTP RPC URL
+                    if cfg.network.enable_flashblocks.unwrap_or(false) {
+                        cfg.network.flashblocks_rpc_url.clone()
+                            .unwrap_or_else(|| cfg.network.http_rpc_url.clone().unwrap_or_else(|| cfg.network.ws_rpc_url.clone()))
+                    } else {
+                        cfg.network.http_rpc_url.clone().unwrap_or_else(|| cfg.network.ws_rpc_url.clone())
+                    }
+                };
+
+                let mempool_provider = Arc::new(
+                    ProviderBuilder::new()
+                        .connect(&rpc_url)
+                        .await
+                        .context("Failed to connect mempool provider")?,
+                );
+
+                let mempool_monitor = Arc::new(mempool_monitor::MempoolMonitor::new(
+                    mempool_provider,
+                    config.clone(),
+                    self.deployment().boundless_market_address,
+                    chain_id,
+                    new_order_tx.clone(),
+                    mempool_config,
+                ));
+
+                let cloned_config = config.clone();
+                let cancel_token = non_critical_cancel_token.clone();
+                supervisor_tasks.spawn(async move {
+                    Supervisor::new(mempool_monitor, cloned_config, cancel_token)
+                        .spawn()
+                        .await
+                        .context("Failed to start mempool monitor")?;
+                    Ok(())
+                });
+            } else {
+                tracing::info!("Mempool monitoring is disabled");
+            }
+        }
 
         let set_builder_img_id = self.fetch_and_upload_set_builder_image(&prover).await?;
         let assessor_img_id = self.fetch_and_upload_assessor_image(&prover).await?;
@@ -1111,3 +1157,4 @@ pub mod test_utils {
 
 #[cfg(test)]
 pub mod tests;
+

@@ -77,6 +77,27 @@ mod defaults {
     pub const fn max_concurrent_preflights() -> u32 {
         4
     }
+
+    // Mempool monitoring defaults
+    pub const fn mempool_poll_interval_ms() -> u64 {
+        1000  // 1 second = 1000ms
+    }
+
+    pub const fn mempool_max_pending_tx_per_poll() -> usize {
+        100
+    }
+
+    pub const fn mempool_rpc_timeout_secs() -> u64 {
+        5
+    }
+
+    pub const fn mempool_use_nonce_monitoring() -> bool {
+        true
+    }
+
+    pub const fn skip_preflight() -> bool {
+        true  // 默认跳过预检，启用优化模式
+    }
 }
 
 /// Order pricing priority mode for determining which orders to price first
@@ -110,6 +131,73 @@ pub enum OrderCommitmentPriority {
 impl Default for OrderCommitmentPriority {
     fn default() -> Self {
         Self::Random
+    }
+}
+
+/// Mempool monitoring configuration
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MempoolConf {
+    /// Whether mempool monitoring is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Polling interval for pending transactions in milliseconds
+    #[serde(default = "defaults::mempool_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Maximum number of pending transactions to process per poll
+    #[serde(default = "defaults::mempool_max_pending_tx_per_poll")]
+    pub max_pending_tx_per_poll: usize,
+    /// Timeout for individual RPC calls in seconds
+    #[serde(default = "defaults::mempool_rpc_timeout_secs")]
+    pub rpc_timeout_secs: u64,
+    /// Whether to use pending nonce monitoring for faster detection
+    #[serde(default = "defaults::mempool_use_nonce_monitoring")]
+    pub use_nonce_monitoring: bool,
+    /// Addresses to monitor for nonce changes (for faster detection)
+    #[serde(default)]
+    pub monitored_addresses: Vec<String>, // Use String for easier config, convert to Address later
+}
+
+impl Default for MempoolConf {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: defaults::mempool_poll_interval_ms(),
+            max_pending_tx_per_poll: defaults::mempool_max_pending_tx_per_poll(),
+            rpc_timeout_secs: defaults::mempool_rpc_timeout_secs(),
+            use_nonce_monitoring: defaults::mempool_use_nonce_monitoring(),
+            monitored_addresses: vec![],
+        }
+    }
+}
+
+/// Network RPC configuration
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct NetworkConf {
+    /// WebSocket RPC URL for subscriptions (eth_subscribe)
+    pub ws_rpc_url: String,
+    /// Optional HTTP RPC URL for regular calls. If None, ws_rpc_url will be reused.
+    pub http_rpc_url: Option<String>,
+    /// Enable Flashblocks for faster transaction confirmation
+    pub enable_flashblocks: Option<bool>,
+    /// Flashblocks RPC URL for regular calls when enabled
+    pub flashblocks_rpc_url: Option<String>,
+    /// Flashblocks WebSocket URL for event subscriptions when enabled
+    pub flashblocks_ws_url: Option<String>,
+    /// Mempool monitoring configuration
+    #[serde(default)]
+    pub mempool: MempoolConf,
+}
+
+impl Default for NetworkConf {
+    fn default() -> Self {
+        Self { 
+            ws_rpc_url: "ws://localhost:8546".into(), 
+            http_rpc_url: None,
+            enable_flashblocks: Some(false),
+            flashblocks_rpc_url: Some("https://sepolia-preconf.base.org".into()),
+            flashblocks_ws_url: Some("wss://sepolia.flashblocks.base.org/ws".into()),
+            mempool: MempoolConf::default(),
+        }
     }
 }
 
@@ -222,6 +310,10 @@ pub struct MarketConf {
     ///
     /// If the stake balance drops below this the broker will issue error logs
     pub stake_balance_error_threshold: Option<String>,
+    /// Skip preflight execution for immediate order processing (optimization)
+    /// Default: true (enabled for maximum speed)
+    #[serde(default = "defaults::skip_preflight")]
+    pub skip_preflight: bool,
     /// Max concurrent proofs
     ///
     /// Maximum number of concurrent proofs that can be processed at once
@@ -286,6 +378,7 @@ impl Default for MarketConf {
             max_concurrent_preflights: defaults::max_concurrent_preflights(),
             order_pricing_priority: OrderPricingPriority::default(),
             order_commitment_priority: OrderCommitmentPriority::default(),
+            skip_preflight: defaults::skip_preflight(),
         }
     }
 }
@@ -428,6 +521,9 @@ pub struct Config {
     pub prover: ProverConf,
     /// Aggregation batch configs
     pub batcher: BatcherConfig,
+    /// Network and optimization configurations
+    #[serde(default)]
+    pub network: NetworkConf,
 }
 
 impl Config {
